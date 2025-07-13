@@ -74,7 +74,8 @@ class OilSpillEnvironment:
     def reset(self):
         self.current_step = 0
         idx = np.random.randint(0, len(self.oil_maps))
-        self.current_oil_map = self.oil_maps[idx]
+        # 复制油污数据，使其可修改
+        self.current_oil_map = self.oil_maps[idx].copy()
         self.agent_positions = []
         for _ in range(self.num_agents):
             x = np.random.randint(0, self.grid_size)
@@ -83,6 +84,21 @@ class OilSpillEnvironment:
         self.last_total_oil = np.sum(self.current_oil_map[0])
         self.response_time = np.zeros((self.grid_size, self.grid_size))  # 记录每个格点最后被响应的时间
         return self._get_state()
+    def _clean_oil_around(self, x, y, intensity):
+        """清理智能体周围的油污"""
+        radius = max(1, int(intensity * 3))  # 作业强度决定清理范围
+        cleaned_amount = 0
+        for dx in range(-radius, radius+1):
+            for dy in range(-radius, radius+1):
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < self.grid_size and 0 <= ny < self.grid_size:
+                    # 清理油污（减少浓度）
+                    old_oil = self.current_oil_map[self.current_step, ny, nx]
+                    clean_rate = intensity * 0.2  # 清理效率
+                    self.current_oil_map[self.current_step, ny, nx] *= (1 - clean_rate)
+                    self.current_oil_map[self.current_step, ny, nx] = max(0, self.current_oil_map[self.current_step, ny, nx])
+                    cleaned_amount += old_oil - self.current_oil_map[self.current_step, ny, nx]
+        return cleaned_amount
     def _get_state(self):
         states = []
         current_oil = self.current_oil_map[self.current_step]
@@ -106,13 +122,9 @@ class OilSpillEnvironment:
         return np.array(states, dtype=np.float32)
     def step(self, actions):
         rewards = []
-        current_oil = self.current_oil_map[self.current_step]
         prev_total_oil = self.last_total_oil
-        # 计算油污减少量
-        total_oil = np.sum(current_oil)
-        oil_reduction = prev_total_oil - total_oil
-        self.last_total_oil = total_oil
-        # 计算资源调度成本（所有船只移动距离+作业强度）
+        # 智能体移动和清理油污
+        total_cleaned = 0
         resource_cost = 0
         for i, action in enumerate(actions):
             dx, dy, op_intensity = action
@@ -124,18 +136,31 @@ class OilSpillEnvironment:
             move_dist = np.sqrt((new_x - old_x) ** 2 + (new_y - old_y) ** 2)
             resource_cost += move_dist + abs(op_intensity)
             self.agent_positions[i] = [new_x, new_y]
-            # 响应时间记录
-            if current_oil[new_y, new_x] > 0.01:
-                self.response_time[new_y, new_x] = self.current_step
+            
+            # 清理油污
+            if op_intensity > 0:
+                cleaned = self._clean_oil_around(new_x, new_y, op_intensity)
+                total_cleaned += cleaned
+                # 响应时间记录
+                if self.current_oil_map[self.current_step, new_y, new_x] > 0.01:
+                    self.response_time[new_y, new_x] = self.current_step
+        
+        # 计算油污减少量（基于实际清理效果）
+        current_total_oil = np.sum(self.current_oil_map[self.current_step])
+        oil_reduction = prev_total_oil - current_total_oil
+        self.last_total_oil = current_total_oil
+        
         # 响应延迟惩罚（未被及时响应的污染点）
         delay_penalty = 0
         if self.current_step > 0:
             # 统计当前油污点中，长时间未被响应的格点
-            mask = (current_oil > 0.01) & (self.response_time < self.current_step - 5)
+            mask = (self.current_oil_map[self.current_step] > 0.01) & (self.response_time < self.current_step - 5)
             delay_penalty = np.sum(mask)
+        
         # 计算最终奖励
         reward = ALPHA * oil_reduction - BETA * resource_cost - GAMMA * delay_penalty
         rewards = [reward] * self.num_agents  # 所有智能体共享全局奖励
+        
         self.current_step += 1
         done = self.current_step >= min(EPISODE_LENGTH, self.current_oil_map.shape[0])
         next_state = self._get_state() if not done else None
